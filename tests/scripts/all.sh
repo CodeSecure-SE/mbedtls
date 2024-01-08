@@ -189,6 +189,10 @@ pre_initialize_variables () {
     if [ -z "${MAKEFLAGS+set}" ]; then
         export MAKEFLAGS="-j$(all_sh_nproc)"
     fi
+    # if CC is not set, use clang by default (if present) to improve build times
+    if [ -z "${CC+set}" ] && (type clang > /dev/null 2>&1); then
+        export CC="clang"
+    fi
 
     # Include more verbose output for failing tests run by CMake or make
     export CTEST_OUTPUT_ON_FAILURE=1
@@ -207,15 +211,8 @@ pre_initialize_variables () {
     # defined in this script whose name starts with "component_".
     ALL_COMPONENTS=$(compgen -A function component_ | sed 's/component_//')
 
-    # Exclude components that are not supported on this platform.
-    SUPPORTED_COMPONENTS=
-    for component in $ALL_COMPONENTS; do
-        case $(type "support_$component" 2>&1) in
-            *' function'*)
-                if ! support_$component; then continue; fi;;
-        esac
-        SUPPORTED_COMPONENTS="$SUPPORTED_COMPONENTS $component"
-    done
+    # Delay determinig SUPPORTED_COMPONENTS until the command line options have a chance to override
+    # the commands set by the environment
 }
 
 # Test whether the component $1 is included in the command line patterns.
@@ -425,22 +422,11 @@ check_tools()
     done
 }
 
-pre_parse_command_line_for_dirs () {
-    # Make an early pass through the options given, so we can set directories
-    # for Arm compilers, before SUPPORTED_COMPONENTS is determined.
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --armc5-bin-dir) shift; ARMC5_BIN_DIR="$1";;
-            --armc6-bin-dir) shift; ARMC6_BIN_DIR="$1";;
-        esac
-        shift
-    done
-}
-
 pre_parse_command_line () {
     COMMAND_LINE_COMPONENTS=
     all_except=0
     error_test=0
+    list_components=0
     restore_first=0
     no_armcc=
 
@@ -453,8 +439,8 @@ pre_parse_command_line () {
             --arm-none-eabi-gcc-prefix) shift; ARM_NONE_EABI_GCC_PREFIX="$1";;
             --arm-linux-gnueabi-gcc-prefix) shift; ARM_LINUX_GNUEABI_GCC_PREFIX="$1";;
             --armcc) no_armcc=;;
-            --armc5-bin-dir) shift; ;; # assignment to ARMC5_BIN_DIR done in pre_parse_command_line_for_dirs
-            --armc6-bin-dir) shift; ;; # assignment to ARMC6_BIN_DIR done in pre_parse_command_line_for_dirs
+            --armc5-bin-dir) shift; ARMC5_BIN_DIR="$1";;
+            --armc6-bin-dir) shift; ARMC6_BIN_DIR="$1";;
             --clang-earliest) shift; CLANG_EARLIEST="$1";;
             --clang-latest) shift; CLANG_LATEST="$1";;
             --error-test) error_test=$((error_test + 1));;
@@ -469,7 +455,7 @@ pre_parse_command_line () {
             --help|-h) usage; exit;;
             --keep-going|-k) KEEP_GOING=1;;
             --list-all-components) printf '%s\n' $ALL_COMPONENTS; exit;;
-            --list-components) printf '%s\n' $SUPPORTED_COMPONENTS; exit;;
+            --list-components) list_components=1;;
             --memory|-m) MEMORY=1;;
             --no-append-outcome) append_outcome=0;;
             --no-armcc) no_armcc=1;;
@@ -495,6 +481,21 @@ pre_parse_command_line () {
         esac
         shift
     done
+
+    # Exclude components that are not supported on this platform.
+    SUPPORTED_COMPONENTS=
+    for component in $ALL_COMPONENTS; do
+        case $(type "support_$component" 2>&1) in
+            *' function'*)
+                if ! support_$component; then continue; fi;;
+        esac
+        SUPPORTED_COMPONENTS="$SUPPORTED_COMPONENTS $component"
+    done
+
+    if [ $list_components -eq 1 ]; then
+        printf '%s\n' $SUPPORTED_COMPONENTS
+        exit
+    fi
 
     # With no list of components, run everything.
     if [ -z "$COMMAND_LINE_COMPONENTS" ] && [ $restore_first -eq 0 ]; then
@@ -1549,8 +1550,6 @@ component_test_full_no_cipher () {
     # Disable features that depend on CIPHER_C
     scripts/config.py unset MBEDTLS_CMAC_C
     scripts/config.py unset MBEDTLS_NIST_KW_C
-    scripts/config.py unset MBEDTLS_PKCS12_C
-    scripts/config.py unset MBEDTLS_PKCS5_C
     scripts/config.py unset MBEDTLS_PSA_CRYPTO_C
     scripts/config.py unset MBEDTLS_SSL_TLS_C
     scripts/config.py unset MBEDTLS_SSL_TICKET_C
@@ -1601,15 +1600,10 @@ common_test_full_no_cipher_with_psa_crypto () {
         # Disable cipher modes/keys that make PSA depend on CIPHER_C.
         # Keep CHACHA20 and CHACHAPOLY enabled since they do not depend on CIPHER_C.
         scripts/config.py unset-all MBEDTLS_CIPHER_MODE
-        scripts/config.py unset MBEDTLS_DES_C
-        # Dependencies on AES_C
-        scripts/config.py unset MBEDTLS_CTR_DRBG_C
     fi
     # The following modules directly depends on CIPHER_C
     scripts/config.py unset MBEDTLS_CMAC_C
     scripts/config.py unset MBEDTLS_NIST_KW_C
-    scripts/config.py unset MBEDTLS_PKCS12_C
-    scripts/config.py unset MBEDTLS_PKCS5_C
 
     make
 
@@ -2177,7 +2171,7 @@ component_test_default_no_deprecated () {
     # configuration leaves something consistent.
     msg "build: make, default + MBEDTLS_DEPRECATED_REMOVED" # ~ 30s
     scripts/config.py set MBEDTLS_DEPRECATED_REMOVED
-    make CC=gcc CFLAGS='-O -Werror -Wall -Wextra'
+    make CFLAGS='-O -Werror -Wall -Wextra'
 
     msg "test: make, default + MBEDTLS_DEPRECATED_REMOVED" # ~ 5s
     make test
@@ -2186,7 +2180,7 @@ component_test_default_no_deprecated () {
 component_test_full_no_deprecated () {
     msg "build: make, full_no_deprecated config" # ~ 30s
     scripts/config.py full_no_deprecated
-    make CC=gcc CFLAGS='-O -Werror -Wall -Wextra'
+    make CFLAGS='-O -Werror -Wall -Wextra'
 
     msg "test: make, full_no_deprecated config" # ~ 5s
     make test
@@ -2203,7 +2197,7 @@ component_test_full_no_deprecated_deprecated_warning () {
     scripts/config.py full_no_deprecated
     scripts/config.py unset MBEDTLS_DEPRECATED_REMOVED
     scripts/config.py set MBEDTLS_DEPRECATED_WARNING
-    make CC=gcc CFLAGS='-O -Werror -Wall -Wextra'
+    make CFLAGS='-O -Werror -Wall -Wextra'
 
     msg "test: make, full_no_deprecated config, MBEDTLS_DEPRECATED_WARNING" # ~ 5s
     make test
@@ -2216,6 +2210,8 @@ component_test_full_deprecated_warning () {
     scripts/config.py full
     scripts/config.py set MBEDTLS_DEPRECATED_WARNING
     # Expect warnings from '#warning' directives in check_config.h.
+    # Note that gcc is required to allow the use of -Wno-error=cpp, which allows us to
+    # display #warning messages without them being treated as errors.
     make CC=gcc CFLAGS='-O -Werror -Wall -Wextra -Wno-error=cpp' lib programs
 
     msg "build: make tests, full config + MBEDTLS_DEPRECATED_WARNING, expect warnings" # ~ 30s
@@ -2386,7 +2382,7 @@ component_build_no_pk_rsa_alt_support () {
     scripts/config.py set MBEDTLS_X509_CRT_WRITE_C
 
     # Only compile - this is primarily to test for compile issues
-    make CC=gcc CFLAGS='-Werror -Wall -Wextra -I../tests/include/alt-dummy'
+    make CFLAGS='-Werror -Wall -Wextra -I../tests/include/alt-dummy'
 }
 
 component_build_module_alt () {
@@ -2419,7 +2415,7 @@ component_build_module_alt () {
 
     # We can only compile, not link, since we don't have any implementations
     # suitable for testing with the dummy alt headers.
-    make CC=gcc CFLAGS='-Werror -Wall -Wextra -I../tests/include/alt-dummy' lib
+    make CFLAGS='-Werror -Wall -Wextra -I../tests/include/alt-dummy' lib
 }
 
 component_build_dhm_alt () {
@@ -2430,7 +2426,7 @@ component_build_dhm_alt () {
     scripts/config.py unset MBEDTLS_DEBUG_C
     # We can only compile, not link, since we don't have any implementations
     # suitable for testing with the dummy alt headers.
-    make CC=gcc CFLAGS='-Werror -Wall -Wextra -I../tests/include/alt-dummy' lib
+    make CFLAGS='-Werror -Wall -Wextra -I../tests/include/alt-dummy' lib
 }
 
 component_test_no_use_psa_crypto_full_cmake_asan() {
@@ -3658,12 +3654,19 @@ component_test_psa_crypto_config_reference_hash_use_psa() {
     tests/ssl-opt.sh
 }
 
-component_test_psa_crypto_config_accel_cipher () {
-    msg "test: MBEDTLS_PSA_CRYPTO_CONFIG with accelerated cipher"
+component_test_psa_crypto_config_accel_des () {
+    msg "test: MBEDTLS_PSA_CRYPTO_CONFIG with accelerated DES"
 
+    # Albeit this components aims at accelerating DES which should only support
+    # CBC and ECB modes, we need to accelerate more than that otherwise DES_C
+    # would automatically be re-enabled by "config_adjust_legacy_from_psa.c"
     loc_accel_list="ALG_ECB_NO_PADDING ALG_CBC_NO_PADDING ALG_CBC_PKCS7 \
                     ALG_CTR ALG_CFB ALG_OFB ALG_XTS ALG_CMAC \
                     KEY_TYPE_DES"
+
+    # Note: we cannot accelerate all ciphers' key types otherwise we would also
+    # have to either disable CCM/GCM or accelerate them, but that's out of scope
+    # of this component. This limitation will be addressed by #8598.
 
     # Configure
     # ---------
@@ -3694,7 +3697,7 @@ component_test_psa_crypto_config_accel_cipher () {
     # Run the tests
     # -------------
 
-    msg "test: MBEDTLS_PSA_CRYPTO_CONFIG with accelerated cipher"
+    msg "test: MBEDTLS_PSA_CRYPTO_CONFIG with accelerated DES"
     make test
 }
 
@@ -3743,12 +3746,6 @@ component_test_psa_crypto_config_accel_aead () {
 common_psa_crypto_config_accel_cipher_aead() {
     # Start from the full config
     helper_libtestdriver1_adjust_config "full"
-
-    # CIPHER_C is disabled in the accelerated test component so we disable
-    # all the features that depend on it both in the accelerated and in the
-    # reference components.
-    scripts/config.py unset MBEDTLS_PKCS5_C
-    scripts/config.py unset MBEDTLS_PKCS12_C
 
     scripts/config.py unset MBEDTLS_NIST_KW_C
 }
@@ -3839,6 +3836,86 @@ component_test_psa_crypto_config_reference_cipher_aead () {
     tests/compat.sh -V NO -p mbedTLS
 }
 
+common_block_cipher_dispatch() {
+    TEST_WITH_DRIVER="$1"
+
+    # Start from the full config
+    helper_libtestdriver1_adjust_config "full"
+
+    if [ "$TEST_WITH_DRIVER" -eq 1 ]; then
+        # Disable key types that are accelerated (there is no legacy equivalent
+        # symbol for ECB)
+        scripts/config.py unset MBEDTLS_AES_C
+        scripts/config.py unset MBEDTLS_ARIA_C
+        scripts/config.py unset MBEDTLS_CAMELLIA_C
+    fi
+
+    # Disable cipher's modes that, when not accelerated, cause
+    # legacy key types to be re-enabled in "config_adjust_legacy_from_psa.h".
+    # Keep this also in the reference component in order to skip the same tests
+    # that were skipped in the accelerated one.
+    scripts/config.py -f "$CRYPTO_CONFIG_H" unset PSA_WANT_ALG_CTR
+    scripts/config.py -f "$CRYPTO_CONFIG_H" unset PSA_WANT_ALG_CFB
+    scripts/config.py -f "$CRYPTO_CONFIG_H" unset PSA_WANT_ALG_OFB
+    scripts/config.py -f "$CRYPTO_CONFIG_H" unset PSA_WANT_ALG_CBC_NO_PADDING
+    scripts/config.py -f "$CRYPTO_CONFIG_H" unset PSA_WANT_ALG_CBC_PKCS7
+    scripts/config.py -f "$CRYPTO_CONFIG_H" unset PSA_WANT_ALG_CMAC
+    scripts/config.py -f "$CRYPTO_CONFIG_H" unset PSA_WANT_ALG_CCM_STAR_NO_TAG
+
+    # Disable direct dependency on AES_C
+    scripts/config.py unset MBEDTLS_NIST_KW_C
+
+    # Prevent the cipher module from using deprecated PSA path. The reason is
+    # that otherwise there will be tests relying on "aes_info" (defined in
+    # "cipher_wrap.c") whose functions are not available when AES_C is
+    # not defined. ARIA and Camellia are not a problem in this case because
+    # the PSA path is not tested for these key types.
+    scripts/config.py set MBEDTLS_DEPRECATED_REMOVED
+}
+
+component_test_full_block_cipher_psa_dispatch () {
+    msg "build: full + PSA dispatch in block_cipher"
+
+    loc_accel_list="ALG_ECB_NO_PADDING \
+                    KEY_TYPE_AES KEY_TYPE_ARIA KEY_TYPE_CAMELLIA"
+
+    # Configure
+    # ---------
+
+    common_block_cipher_dispatch 1
+
+    # Build
+    # -----
+
+    helper_libtestdriver1_make_drivers "$loc_accel_list"
+
+    helper_libtestdriver1_make_main "$loc_accel_list"
+
+    # Make sure disabled components were not re-enabled by accident (additive
+    # config)
+    not grep mbedtls_aes_ library/aes.o
+    not grep mbedtls_aria_ library/aria.o
+    not grep mbedtls_camellia_ library/camellia.o
+
+    # Run the tests
+    # -------------
+
+    msg "test: full + PSA dispatch in block_cipher"
+    make test
+}
+
+# This is the reference component of component_test_full_block_cipher_psa_dispatch
+component_test_full_block_cipher_legacy_dispatch () {
+    msg "build: full + legacy dispatch in block_cipher"
+
+    common_block_cipher_dispatch 0
+
+    make
+
+    msg "test: full + legacy dispatch in block_cipher"
+    make test
+}
+
 component_test_aead_chachapoly_disabled() {
     msg "build: full minus CHACHAPOLY"
     scripts/config.py full
@@ -3869,7 +3946,7 @@ component_test_ccm_aes_sha256() {
     cp "$CONFIG_TEST_DRIVER_H" "$CONFIG_H"
     cp configs/crypto-config-ccm-aes-sha256.h "$CRYPTO_CONFIG_H"
 
-    make CC=gcc
+    make
 
     msg "test: CCM + AES + SHA256 configuration"
     make test
@@ -4333,7 +4410,7 @@ component_test_memory_buffer_allocator_backtrace () {
     scripts/config.py set MBEDTLS_PLATFORM_MEMORY
     scripts/config.py set MBEDTLS_MEMORY_BACKTRACE
     scripts/config.py set MBEDTLS_MEMORY_DEBUG
-    CC=gcc cmake -DCMAKE_BUILD_TYPE:String=Release .
+    cmake -DCMAKE_BUILD_TYPE:String=Release .
     make
 
     msg "test: MBEDTLS_MEMORY_BUFFER_ALLOC_C and MBEDTLS_MEMORY_BACKTRACE"
@@ -4344,7 +4421,7 @@ component_test_memory_buffer_allocator () {
     msg "build: default config with memory buffer allocator"
     scripts/config.py set MBEDTLS_MEMORY_BUFFER_ALLOC_C
     scripts/config.py set MBEDTLS_PLATFORM_MEMORY
-    CC=gcc cmake -DCMAKE_BUILD_TYPE:String=Release .
+    cmake -DCMAKE_BUILD_TYPE:String=Release .
     make
 
     msg "test: MBEDTLS_MEMORY_BUFFER_ALLOC_C"
@@ -4440,7 +4517,7 @@ component_test_ssl_alloc_buffer_and_mfl () {
     scripts/config.py set MBEDTLS_MEMORY_DEBUG
     scripts/config.py set MBEDTLS_SSL_MAX_FRAGMENT_LENGTH
     scripts/config.py set MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH
-    CC=gcc cmake -DCMAKE_BUILD_TYPE:String=Release .
+    cmake -DCMAKE_BUILD_TYPE:String=Release .
     make
 
     msg "test: MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH, MBEDTLS_MEMORY_BUFFER_ALLOC_C, MBEDTLS_MEMORY_DEBUG and MBEDTLS_SSL_MAX_FRAGMENT_LENGTH"
@@ -4467,7 +4544,7 @@ component_test_when_no_ciphersuites_have_mac () {
 component_test_no_date_time () {
     msg "build: default config without MBEDTLS_HAVE_TIME_DATE"
     scripts/config.py unset MBEDTLS_HAVE_TIME_DATE
-    CC=gcc cmake -D CMAKE_BUILD_TYPE:String=Check .
+    cmake -D CMAKE_BUILD_TYPE:String=Check .
     make
 
     msg "test: !MBEDTLS_HAVE_TIME_DATE - main suites"
@@ -4833,7 +4910,7 @@ component_test_aes_only_128_bit_keys () {
     scripts/config.py set MBEDTLS_AES_ONLY_128_BIT_KEY_LENGTH
     scripts/config.py unset MBEDTLS_PADLOCK_C
 
-    make CC=gcc CFLAGS='-Werror -Wall -Wextra'
+    make CFLAGS='-O2 -Werror -Wall -Wextra'
 
     msg "test: default config + AES_ONLY_128_BIT_KEY_LENGTH"
     make test
@@ -4858,7 +4935,7 @@ component_test_aes_only_128_bit_keys_have_builtins () {
     scripts/config.py unset MBEDTLS_AESNI_C
     scripts/config.py unset MBEDTLS_AESCE_C
 
-    make CC=gcc CFLAGS='-Werror -Wall -Wextra'
+    make CFLAGS='-O2 -Werror -Wall -Wextra'
 
     msg "test: default config + AES_ONLY_128_BIT_KEY_LENGTH - AESNI_C - AESCE_C"
     make test
@@ -4870,7 +4947,7 @@ component_test_aes_only_128_bit_keys_have_builtins () {
 component_test_aes_fewer_tables () {
     msg "build: default config with AES_FEWER_TABLES enabled"
     scripts/config.py set MBEDTLS_AES_FEWER_TABLES
-    make CC=gcc CFLAGS='-Werror -Wall -Wextra'
+    make CFLAGS='-O2 -Werror -Wall -Wextra'
 
     msg "test: AES_FEWER_TABLES"
     make test
@@ -4879,7 +4956,7 @@ component_test_aes_fewer_tables () {
 component_test_aes_rom_tables () {
     msg "build: default config with AES_ROM_TABLES enabled"
     scripts/config.py set MBEDTLS_AES_ROM_TABLES
-    make CC=gcc CFLAGS='-Werror -Wall -Wextra'
+    make CFLAGS='-O2 -Werror -Wall -Wextra'
 
     msg "test: AES_ROM_TABLES"
     make test
@@ -4889,7 +4966,7 @@ component_test_aes_fewer_tables_and_rom_tables () {
     msg "build: default config with AES_ROM_TABLES and AES_FEWER_TABLES enabled"
     scripts/config.py set MBEDTLS_AES_FEWER_TABLES
     scripts/config.py set MBEDTLS_AES_ROM_TABLES
-    make CC=gcc CFLAGS='-Werror -Wall -Wextra'
+    make CFLAGS='-O2 -Werror -Wall -Wextra'
 
     msg "test: AES_FEWER_TABLES + AES_ROM_TABLES"
     make test
@@ -4931,7 +5008,7 @@ helper_block_cipher_no_decrypt_build_test () {
 
     msg "build: default config + BLOCK_CIPHER_NO_DECRYPT${set_opts:+ + $set_opts}${unset_opts:+ - $unset_opts} with $cflags${ldflags:+, $ldflags}"
     make clean
-    make CC=gcc CFLAGS="$cflags" LDFLAGS="$ldflags"
+    make CFLAGS="-O2 $cflags" LDFLAGS="$ldflags"
 
     # Make sure we don't have mbedtls_xxx_setkey_dec in AES/ARIA/CAMELLIA
     not grep mbedtls_aes_setkey_dec library/aes.o
@@ -5001,11 +5078,15 @@ config_block_cipher_no_decrypt () {
 }
 
 component_test_block_cipher_no_decrypt_aesni () {
+    # This consistently causes an llvm crash on clang 3.8, so use gcc
+    export CC=gcc
     config_block_cipher_no_decrypt 0
     common_block_cipher_no_decrypt
 }
 
 component_test_block_cipher_no_decrypt_aesni_use_psa () {
+    # This consistently causes an llvm crash on clang 3.8, so use gcc
+    export CC=gcc
     config_block_cipher_no_decrypt 1
     common_block_cipher_no_decrypt
 }
@@ -5304,7 +5385,7 @@ support_test_m32_everest () {
 component_test_mx32 () {
     msg "build: 64-bit ILP32, make, gcc" # ~ 30s
     scripts/config.py full
-    make CC=gcc CFLAGS='-Werror -Wall -Wextra -mx32' LDFLAGS='-mx32'
+    make CC=gcc CFLAGS='-O2 -Werror -Wall -Wextra -mx32' LDFLAGS='-mx32'
 
     msg "test: 64-bit ILP32, make, gcc"
     make test
@@ -5332,7 +5413,7 @@ component_test_have_int32 () {
     scripts/config.py unset MBEDTLS_AESNI_C
     scripts/config.py unset MBEDTLS_PADLOCK_C
     scripts/config.py unset MBEDTLS_AESCE_C
-    make CC=gcc CFLAGS='-Werror -Wall -Wextra -DMBEDTLS_HAVE_INT32'
+    make CC=gcc CFLAGS='-O2 -Werror -Wall -Wextra -DMBEDTLS_HAVE_INT32'
 
     msg "test: gcc, force 32-bit bignum limbs"
     make test
@@ -5344,7 +5425,7 @@ component_test_have_int64 () {
     scripts/config.py unset MBEDTLS_AESNI_C
     scripts/config.py unset MBEDTLS_PADLOCK_C
     scripts/config.py unset MBEDTLS_AESCE_C
-    make CC=gcc CFLAGS='-Werror -Wall -Wextra -DMBEDTLS_HAVE_INT64'
+    make CC=gcc CFLAGS='-O2 -Werror -Wall -Wextra -DMBEDTLS_HAVE_INT64'
 
     msg "test: gcc, force 64-bit bignum limbs"
     make test
@@ -6006,7 +6087,7 @@ component_build_zeroize_checks () {
     scripts/config.py full
 
     # Only compile - we're looking for sizeof-pointer-memaccess warnings
-    make CC=gcc CFLAGS="'-DMBEDTLS_USER_CONFIG_FILE=\"../tests/configs/user-config-zeroize-memset.h\"' -DMBEDTLS_TEST_DEFINES_ZEROIZE -Werror -Wsizeof-pointer-memaccess"
+    make CFLAGS="'-DMBEDTLS_USER_CONFIG_FILE=\"../tests/configs/user-config-zeroize-memset.h\"' -DMBEDTLS_TEST_DEFINES_ZEROIZE -Werror -Wsizeof-pointer-memaccess"
 }
 
 
@@ -6039,11 +6120,12 @@ component_test_zeroize () {
 }
 
 component_test_psa_compliance () {
+    # The arch tests build with gcc, so require use of gcc here to link properly
     msg "build: make, default config (out-of-box), libmbedcrypto.a only"
-    make -C library libmbedcrypto.a
+    CC=gcc make -C library libmbedcrypto.a
 
     msg "unit test: test_psa_compliance.py"
-    ./tests/scripts/test_psa_compliance.py
+    CC=gcc ./tests/scripts/test_psa_compliance.py
 }
 
 support_test_psa_compliance () {
@@ -6177,7 +6259,6 @@ run_component () {
 
 # Preliminary setup
 pre_check_environment
-pre_parse_command_line_for_dirs "$@"
 pre_initialize_variables
 pre_parse_command_line "$@"
 
